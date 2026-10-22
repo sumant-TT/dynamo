@@ -3377,12 +3377,18 @@ impl OpenAIPreprocessor {
         request: &R,
         hidden_stop_token_ids: &mut Vec<TokenIdType>,
     ) -> Result<Vec<TokenIdType>> {
-        let has_tools = Self::request_has_effective_tools(request);
-        let tool_choice_none = request
-            .tool_choice()
+        let tool_choice = request.tool_choice();
+        let tool_choice_str = tool_choice
             .as_ref()
-            .and_then(|tool_choice| tool_choice.as_str())
-            == Some("none");
+            .and_then(|tool_choice| tool_choice.as_str());
+        let tool_choice_none = tool_choice_str == Some("none");
+        let tool_choice_auto = tool_choice.is_none() || tool_choice_str == Some("auto");
+        // Mirrors `tool_call_parsing_enabled`: history tool calls permit `auto` parsing.
+        let has_tools = Self::request_has_effective_tools(request)
+            || (tool_choice_auto
+                && request
+                    .typed_messages()
+                    .is_some_and(crate::preprocessor::tool_choice::history_has_tool_calls));
 
         if !Self::should_keep_tool_parser_end_tokens_visible(has_tools, tool_choice_none) {
             return Ok(Vec::new());
@@ -5250,7 +5256,8 @@ impl OpenAIPreprocessor {
             .as_deref()
             .is_some_and(|parser| matches!(parser, "kimi_k3" | "kimi-k3"));
         let tool_call_parsing_enabled = Self::tool_call_parsing_enabled(request);
-        let has_tools = request.inner.has_effective_tools();
+        // History tool calls can permit parsing for a request that declares no tools.
+        let has_tools = request.inner.has_effective_tools() || tool_call_parsing_enabled;
         let should_jail = if tool_call_parsing_enabled || parser_unwraps_all_kimi_k3_responses {
             Self::should_apply_tool_jail(
                 effective_tool_call_parser.as_ref(),
@@ -10147,6 +10154,55 @@ mod tests {
     }
 
     #[test]
+    fn history_tool_call_without_tools_routes_to_tool_jail() {
+        let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/sample-models/mock-llama-3.1-8b-instruct");
+        let mut card = ModelDeploymentCard::load_from_disk(model_path, None).unwrap();
+        card.runtime_config.tool_call_parser = Some("minimax_m3".to_string());
+        let preprocessor = OpenAIPreprocessor::new(card).unwrap();
+        let route = |messages: serde_json::Value| {
+            let request: NvCreateChatCompletionRequest =
+                serde_json::from_value(serde_json::json!({
+                    "model": "test",
+                    "messages": messages
+                }))
+                .unwrap();
+            let constraint = crate::preprocessor::tool_choice::guided_tool_constraint(
+                &request,
+                Some("minimax_m3"),
+                None,
+                false,
+            )
+            .unwrap();
+            preprocessor
+                .tool_processing_route(&request, &constraint)
+                .unwrap()
+        };
+
+        assert_eq!(
+            route(serde_json::json!([
+                {"role": "user", "content": "list the skills"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "list_skills", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_0", "content": "unavailable"},
+                {"role": "user", "content": "try again"}
+            ])),
+            ToolProcessingRoute::LegacyJail(Some("minimax_m3".to_string()))
+        );
+        assert_eq!(
+            route(serde_json::json!([{"role": "user", "content": "hello"}])),
+            ToolProcessingRoute::PassThrough
+        );
+    }
+
+    #[test]
     fn experimental_flag_uses_explicit_v2_compatibility_validation() {
         if crate::test_utils::run_isolated(
             concat!(
@@ -11142,6 +11198,86 @@ mod tests {
             .unwrap();
         assert!(none_visible.is_empty());
         assert_eq!(none_hidden, [HARMONY_CALL_TOKEN_ID, 7]);
+    }
+
+    fn history_tool_call_request(model: &str) -> NvCreateChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": model,
+            "messages": [
+                {"role": "user", "content": "list the skills"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "list_skills", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_0", "content": "unavailable"},
+                {"role": "user", "content": "try again"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn hidden_stop_path_recognizes_history_tool_calls() {
+        let request = history_tool_call_request("openai/gpt-oss-20b");
+        assert!(request.inner.tools.is_none());
+
+        let mut hidden = vec![HARMONY_CALL_TOKEN_ID, 7];
+        let visible = hidden_stop_preprocessor()
+            .remove_tool_parser_end_tokens_from_hidden_stops(&request, &mut hidden)
+            .unwrap();
+        assert_eq!(visible, [HARMONY_CALL_TOKEN_ID]);
+        assert_eq!(hidden, [7]);
+    }
+
+    #[tokio::test]
+    async fn minimax_m3_history_tool_call_without_tools_is_parsed() {
+        let request = history_tool_call_request("MiniMaxAI/MiniMax-M3");
+        let tool_call_parsing_enabled = OpenAIPreprocessor::tool_call_parsing_enabled(&request);
+        assert!(tool_call_parsing_enabled);
+
+        let jailed = OpenAIPreprocessor::apply_tool_calling_jail(
+            Some("minimax_m3".to_string()),
+            request.inner.tool_choice.clone(),
+            None,
+            false,
+            false,
+            stream::iter(vec![
+                glm47_stream_chunk(
+                    concat!(
+                        "]<]minimax[>[<tool_call>\n",
+                        "]<]minimax[>[<invoke name=\"list_skills\">]<]minimax[>[</invoke>\n",
+                        "]<]minimax[>[</tool_call>"
+                    ),
+                    None,
+                ),
+                terminal_chat_stream_chunk(),
+            ]),
+        );
+        let responses: Vec<_> =
+            OpenAIPreprocessor::apply_tool_call_response_policy(jailed, tool_call_parsing_enabled)
+                .collect()
+                .await;
+
+        let choices: Vec<_> = responses
+            .iter()
+            .flat_map(|response| response.data.iter())
+            .flat_map(|data| data.inner.choices.iter())
+            .collect();
+        let names: Vec<_> = choices
+            .iter()
+            .flat_map(|choice| choice.delta.tool_calls.iter().flatten())
+            .filter_map(|call| call.function.as_ref()?.name.as_deref())
+            .collect();
+        assert_eq!(names, ["list_skills"]);
+        assert!(choices.iter().all(|choice| match &choice.delta.content {
+            Some(ChatCompletionMessageContent::Text(text)) => !text.contains("minimax"),
+            _ => true,
+        }));
     }
 
     async fn apply_kimi_k3_no_tools(

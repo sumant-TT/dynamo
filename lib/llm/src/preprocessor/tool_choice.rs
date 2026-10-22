@@ -15,7 +15,8 @@ use crate::protocols::openai::{GuidedToolConstraint, validate};
 
 use dynamo_parsers::tool_calling::{ToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
-    ChatCompletionTool, ChatCompletionToolChoiceOption, CreateChatCompletionRequest, ResponseFormat,
+    ChatCompletionRequestMessage, ChatCompletionTool, ChatCompletionToolChoiceOption,
+    CreateChatCompletionRequest, ResponseFormat,
 };
 use dynamo_runtime::error::{DynamoError, ErrorType};
 
@@ -37,19 +38,23 @@ impl OpenAIPreprocessor {
     /// whether the request supplies effective tools and whether `tool_choice`
     /// forbids them. Effective tools include both the OpenAI top-level list and
     /// Kimi-style dynamic declarations carried by system messages.
+    /// An `auto` request without effective tools is still permitted when its
+    /// history holds an assistant tool call: the client already runs that tool.
     /// Assistant-output constraints apply to assistant content and do not revoke
     /// an `auto` request's ability to choose a tool call.
     pub(crate) fn tool_call_parsing_enabled(request: &NvCreateChatCompletionRequest) -> bool {
-        if !request.inner.has_effective_tools() {
-            return false;
-        }
-
-        match request
+        let tool_choice = request
             .inner
             .tool_choice
             .as_ref()
-            .unwrap_or(&ChatCompletionToolChoiceOption::Auto)
-        {
+            .unwrap_or(&ChatCompletionToolChoiceOption::Auto);
+
+        if !request.inner.has_effective_tools() {
+            return matches!(tool_choice, ChatCompletionToolChoiceOption::Auto)
+                && history_has_tool_calls(&request.inner.messages);
+        }
+
+        match tool_choice {
             ChatCompletionToolChoiceOption::None => false,
             ChatCompletionToolChoiceOption::Required | ChatCompletionToolChoiceOption::Named(_) => {
                 true
@@ -214,6 +219,17 @@ pub(super) fn has_explicit_guided_decoding(request: &NvCreateChatCompletionReque
             .as_ref()
             .is_some_and(|v| !v.is_empty())
         || request.common.guided_grammar.is_some()
+}
+
+/// Whether any assistant message in `messages` carries a tool call.
+pub(crate) fn history_has_tool_calls(messages: &[ChatCompletionRequestMessage]) -> bool {
+    messages.iter().any(|message| {
+        matches!(
+            message,
+            ChatCompletionRequestMessage::Assistant(assistant)
+                if assistant.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty())
+        )
+    })
 }
 
 fn has_response_format_constraint(request: &NvCreateChatCompletionRequest) -> bool {
@@ -432,6 +448,54 @@ mod tests {
         )));
         assert!(!OpenAIPreprocessor::tool_call_parsing_enabled(&request(
             json!({"tool_choice": "required"})
+        )));
+    }
+
+    fn tool_call_history() -> Value {
+        json!([
+            {"role": "user", "content": "list the skills"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "list_skills", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "content": "unavailable, retry later"},
+            {"role": "user", "content": "try again"}
+        ])
+    }
+
+    #[test]
+    fn history_tool_calls_enable_parsing_for_auto_without_tools() {
+        for (tool_choice, expected) in [
+            (json!(null), true),
+            (json!("auto"), true),
+            (json!("none"), false),
+            (json!("required"), false),
+        ] {
+            let mut extra = json!({"messages": tool_call_history()});
+            if !tool_choice.is_null() {
+                extra["tool_choice"] = tool_choice;
+            }
+            assert_eq!(
+                OpenAIPreprocessor::tool_call_parsing_enabled(&request(extra)),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn history_without_tool_calls_does_not_enable_parsing() {
+        let messages = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello", "tool_calls": []},
+            {"role": "user", "content": "again"}
+        ]);
+        assert!(!OpenAIPreprocessor::tool_call_parsing_enabled(&request(
+            json!({"messages": messages})
         )));
     }
 
